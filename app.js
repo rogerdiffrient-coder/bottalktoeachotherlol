@@ -9,7 +9,32 @@ const defaultState = {
 
 let state = loadState();
 let installedModels = [];
+let cloudModels = [];
 let busy = false;
+
+const FALLBACK_CLOUD_MODELS = [
+  "nemotron-3-super:cloud",
+  "glm-5.1:cloud",
+  "glm-5.2:cloud",
+  "kimi-k2.6:cloud",
+  "kimi-k2.7-code:cloud",
+  "gpt-oss:120b-cloud",
+  "glm-5.3-flash:cloud",
+  "deepseek-v4-flash:0731-cloud",
+  "minimax-m2.7:cloud",
+  "gemma4:cloud",
+  "gemma4:31b-cloud",
+  "qwen3.5:cloud",
+  "qwen3.5:397b-cloud",
+  "nemotron-3-nano:30b-cloud",
+  "nemotron-3-ultra:cloud",
+  "kimi-k3:cloud",
+  "deepseek-v4-pro:0813-cloud",
+  "minimax-m3:cloud",
+  "glm-5.3:cloud",
+  "gpt-oss:20b-cloud",
+  "mistral-large-3:675b-cloud"
+];
 
 const $ = id => document.getElementById(id);
 const els = {
@@ -135,10 +160,28 @@ function closeModal() {
 }
 els.modalBackdrop.addEventListener("click", e => { if (e.target === els.modalBackdrop) closeModal(); });
 
+function optionHtml(m, selected) {
+  return '<option value="'+esc(m)+'"'+(m===selected?' selected':'')+'>'+esc(m)+'</option>';
+}
+
 function modelOptions(selected="") {
-  const models = [...new Set([selected, ...installedModels].filter(Boolean))];
-  if (!models.length) return '<option value="">No models detected</option>';
-  return models.map(m => '<option value="'+esc(m)+'"'+(m===selected?' selected':'')+'>'+esc(m)+'</option>').join("");
+  const locals=[...new Set(installedModels.filter(Boolean))].sort();
+  const clouds=[...new Set(cloudModels.filter(Boolean))]
+    .filter(m=>!locals.includes(m))
+    .sort();
+
+  let html="";
+  if (selected && !locals.includes(selected) && !clouds.includes(selected)) {
+    html += '<optgroup label="Current"><option value="'+esc(selected)+'" selected>'+esc(selected)+'</option></optgroup>';
+  }
+  if (locals.length) {
+    html += '<optgroup label="Local / already available">'+locals.map(m=>optionHtml(m,selected)).join("")+'</optgroup>';
+  }
+  if (clouds.length) {
+    html += '<optgroup label="Ollama Cloud">'+clouds.map(m=>optionHtml(m,selected)).join("")+'</optgroup>';
+  }
+  if (!html) html='<option value="">No models detected</option>';
+  return html;
 }
 
 function openUserEditor(userId=null) {
@@ -248,19 +291,50 @@ function openSettings() {
   $("clearData").onclick = ()=>{ if(confirm("Delete every local user, chat, message, and overview?")){ localStorage.removeItem(STORAGE_KEY); localStorage.removeItem("ollama-gc-v1"); state=clone(defaultState); closeModal(); render(); } };
 }
 
+function toCloudModelName(name) {
+  if (!name) return "";
+  if (name.endsWith(":cloud") || name.endsWith("-cloud")) return name;
+  const i=name.indexOf(":");
+  if (i === -1) return name+":cloud";
+  const base=name.slice(0,i);
+  const tag=name.slice(i+1);
+  return base+":"+tag+"-cloud";
+}
+
+async function loadCloudModels() {
+  try {
+    const r=await fetch("https://ollama.com/api/tags");
+    if (!r.ok) throw new Error("HTTP "+r.status);
+    const d=await r.json();
+    const names=(d.models||[]).map(m=>m.name||m.model).filter(Boolean);
+    const converted=names.map(toCloudModelName);
+
+    // Ollama also exposes family-level cloud aliases for some model families.
+    const aliases=[];
+    if (names.some(n=>n.startsWith("gemma4:"))) aliases.push("gemma4:cloud");
+    if (names.some(n=>n.startsWith("qwen3.5:"))) aliases.push("qwen3.5:cloud");
+
+    cloudModels=[...new Set([...converted,...aliases])];
+  } catch(e) {
+    console.warn("Could not refresh Ollama cloud catalog; using fallback list.",e);
+    cloudModels=[...FALLBACK_CLOUD_MODELS];
+  }
+}
+
 async function checkOllama() {
+  await loadCloudModels();
   try {
     const r = await fetch(state.settings.baseUrl.replace(/\/$/,"")+"/api/tags");
     if (!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json();
     installedModels=(d.models||[]).map(m=>m.name).filter(Boolean);
-    els.ollamaStatus.textContent="Ollama connected · "+installedModels.length+" models";
+    els.ollamaStatus.textContent="Ollama connected · "+installedModels.length+" local · "+cloudModels.length+" cloud";
     els.ollamaStatus.classList.remove("offline");
     return true;
   } catch(e) {
     console.error(e);
     installedModels=[];
-    els.ollamaStatus.textContent="Ollama offline";
+    els.ollamaStatus.textContent="Ollama offline · "+cloudModels.length+" cloud listed";
     els.ollamaStatus.classList.add("offline");
     return false;
   }
