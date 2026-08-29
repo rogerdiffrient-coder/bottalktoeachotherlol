@@ -11,6 +11,7 @@ let state = loadState();
 let installedModels = [];
 let cloudModels = [];
 let busy = false;
+let replyingToMessageId = null;
 const chatActivityRunning = new Set();
 const userFailureUntil = new Map();
 const ONE_MINUTE = 60 * 1000;
@@ -83,6 +84,8 @@ function loadState() {
     });
     next.chats.forEach(c => {
       c.messages = Array.isArray(c.messages) ? c.messages.filter(m => !(m.role==="assistant" && !String(m.content||"").trim())) : [];
+      if (typeof c.summary !== "string") c.summary="";
+      if (!Number.isInteger(c.summaryThrough)) c.summaryThrough=0;
     });
     return next;
   } catch (e) {
@@ -108,6 +111,7 @@ function selectChat(chatId) {
   const previousId=state.activeChatId;
   if (previousId && previousId!==chatId) markChatLeft(previousId);
   state.activeChatId=chatId;
+  replyingToMessageId=null;
   const c=getChat(chatId);
   if (c) c.nextAutoAt=null;
   saveState();
@@ -167,6 +171,52 @@ function messageContentHtml(text="") {
   return html;
 }
 
+function getMessage(chat,id) {
+  return (chat?.messages||[]).find(m=>m.id===id)||null;
+}
+
+function speakerForMessage(msg) {
+  if (!msg) return "Unknown";
+  if (msg.role==="human") return "You";
+  return getUser(msg.userId)?.name || msg.name || "AI";
+}
+
+function renderReplyComposer() {
+  let bar=document.getElementById("replyComposerBar");
+  if (!bar) {
+    bar=document.createElement("div");
+    bar.id="replyComposerBar";
+    bar.className="reply-composer hidden";
+    const composer=els.messageInput.closest(".composer");
+    if (composer && composer.parentElement) composer.parentElement.insertBefore(bar,composer);
+  }
+  const chat=activeChat();
+  const msg=getMessage(chat,replyingToMessageId);
+  if (!msg) {
+    bar.classList.add("hidden");
+    bar.innerHTML="";
+    return;
+  }
+  const preview=splitGcThink(msg.content||"").visible.slice(0,180);
+  bar.innerHTML = '<div><strong>Replying to '+esc(speakerForMessage(msg))+'</strong><div>'+esc(preview)+'</div></div><button type="button" class="reply-cancel" title="Cancel reply">×</button>';
+  bar.classList.remove("hidden");
+  bar.querySelector(".reply-cancel").onclick=()=>{
+    replyingToMessageId=null;
+    renderReplyComposer();
+    els.messageInput.focus();
+  };
+}
+
+function startReply(messageId) {
+  replyingToMessageId=messageId;
+  renderReplyComposer();
+  els.messageInput.focus();
+}
+
+function mentionedUsers(text,chat) {
+  const lower=String(text||"").toLowerCase();
+  return (chat.userIds||[]).map(getUser).filter(Boolean).filter(u=>lower.includes("@"+u.name.toLowerCase()));
+}
 function renderActiveChat() {
   const chat = activeChat();
   if (!chat) {
@@ -194,13 +244,20 @@ function renderActiveChat() {
     const name = msg.role === "human" ? "You" : (user?.name || msg.name || "AI");
     const avatar = msg.role === "human" ? "YOU" : initials(name);
     const time = msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) : "";
+    const replied=getMessage(chat,msg.replyTo);
+    const replyPreview=replied
+      ? '<div class="message-reply-preview"><strong>'+esc(speakerForMessage(replied))+'</strong> · '+esc(splitGcThink(replied.content||"").visible.slice(0,120))+'</div>'
+      : "";
     row.innerHTML =
       '<div class="avatar">'+esc(avatar)+'</div>' +
       '<div><div class="message-head"><span class="message-name">'+esc(name)+'</span>' +
-      '<span class="message-time">'+esc(time)+'</span></div>' +
+      '<span class="message-time">'+esc(time)+'</span><button class="message-reply-btn" type="button">Reply</button></div>' +
+      replyPreview +
       '<div class="message-body">'+messageContentHtml(msg.content||"")+'</div></div>';
+    row.querySelector(".message-reply-btn").onclick=()=>startReply(msg.id);
     els.messages.appendChild(row);
   });
+  renderReplyComposer();
   requestAnimationFrame(()=>els.messages.scrollTop = els.messages.scrollHeight);
 }
 
@@ -446,17 +503,25 @@ function buildSystem(u,c) {
     u.personality ? "Your personality:\n"+u.personality : "",
     "Participants: "+participants+".",
     "Reply only as "+u.name+". Do not write dialogue for anyone else and do not prefix replies with your name.",
-    "Your remembrance is a broad rolling overview, not a list of isolated facts:\n"+(u.overview||"(No overview yet.)"),
+    "CONTEXT LAYERS:",
+    "PREVIOUS CHAT MESSAGES (summary of older messages from this exact chat):\n"+(c.summary||"(none yet)"),
+    "EVERYTHING ELSE (big cross-chat summary):\n"+(u.overview||"(No cross-chat overview yet.)"),
+    "The exact recent messages will be supplied separately after this system prompt.",
     "If you want to show a brief user-visible thought summary, put it in <gcthink>...</gcthink>. Keep it concise and high-level. Never use ordinary <think> tags.",
-    "You have a Remember tool. If you need a specific detail from any earlier chat that is not clear in the overview, output exactly [[REMEMBER: search words]] and nothing else. The app will search all chats and give you matching history, then you can answer normally."
+    "You have a Remember tool. If you need a specific detail from any earlier chat that is not clear in the summaries, output exactly [[REMEMBER: search words]] and nothing else. The app will search all chats and give you matching history, then you can answer normally."
   ].filter(Boolean).join("\n\n");
 }
 
 function recentMessages(u,c) {
-  return (c.messages||[]).slice(-32).map(m => {
-    if (m.role==="human") return {role:"user",content:"You: "+m.content};
+  const exact=(c.messages||[]).slice(-18);
+  return exact.map(m => {
+    const replied=getMessage(c,m.replyTo);
+    const replyContext=replied ? " [replying to "+speakerForMessage(replied)+": "+splitGcThink(replied.content||"").visible.slice(0,220)+"]" : "";
+    if (m.role==="human") return {role:"user",content:"You"+replyContext+": "+m.content};
     const speaker=getUser(m.userId)?.name||m.name||"AI";
-    return m.userId===u.id ? {role:"assistant",content:m.content} : {role:"user",content:speaker+": "+m.content};
+    return m.userId===u.id
+      ? {role:"assistant",content:(replyContext?replyContext+" ":"")+m.content}
+      : {role:"user",content:speaker+replyContext+": "+m.content};
   });
 }
 
@@ -523,6 +588,30 @@ async function callUser(u,c,extra="",onChunk=null) {
   return out;
 }
 
+async function updateChatSummary(c) {
+  const messages=c.messages||[];
+  const keepRecent=18;
+  const cutoff=Math.max(0,messages.length-keepRecent);
+  if (cutoff<=0 || cutoff<=c.summaryThrough) return;
+
+  const chunk=messages.slice(c.summaryThrough,cutoff);
+  if (!chunk.length) return;
+  const transcript=chunk.map(m=>speakerForMessage(m)+": "+splitGcThink(m.content||"").visible).join("\n");
+  const summarizer=(c.userIds||[]).map(getUser).filter(Boolean)[0];
+  if (!summarizer) return;
+
+  const prompt=
+    "Update the running summary for this group chat. Preserve important ongoing topics, decisions, jokes, relationships, unresolved questions, and useful context. " +
+    "Compress aggressively, do not quote everything, and do not invent anything. Return one concise paragraph or a few compact paragraphs.\n\n" +
+    "Existing summary:\n"+(c.summary||"(none)")+"\n\nMessages to fold into the summary:\n"+transcript;
+
+  try {
+    c.summary=await rawChat(summarizer.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false});
+    c.summaryThrough=cutoff;
+    saveState();
+  } catch(e) { console.warn("Chat summary update failed",e); }
+}
+
 async function updateOverview(u) {
   const history = allTranscriptLines().filter(x => {
     const relevantChats=state.chats.filter(c=>(c.userIds||[]).includes(u.id)).map(c=>c.name||"Untitled");
@@ -558,10 +647,11 @@ function disableUserForProviderError(u,err) {
   return true;
 }
 
-async function respondAll(extra="") {
+async function respondAll(extra="",targetUserIds=null) {
   const c=activeChat();
   if (!c || busy) return;
-  const users=(c.userIds||[]).map(getUser).filter(Boolean);
+  const allowed=Array.isArray(targetUserIds)&&targetUserIds.length ? new Set(targetUserIds) : null;
+  const users=(c.userIds||[]).map(getUser).filter(Boolean).filter(u=>!allowed||allowed.has(u.id));
   if (!users.length) return;
   busy=true; els.sendBtn.disabled=true;
   try {
@@ -595,7 +685,8 @@ async function respondAll(extra="") {
       }
       c.updatedAt=Date.now(); saveState(); render();
     }
-    setTyping("Updating remembrance…");
+    setTyping("Updating context…");
+    await updateChatSummary(c);
     await Promise.all(users.map(updateOverview));
   } finally {
     busy=false; els.sendBtn.disabled=false; setTyping("");
@@ -691,6 +782,7 @@ async function runChatActivity(chatId,{durationMs=10000,maxTurns=2}={}) {
     const c=getChat(chatId);
     if (c) {
       const users=(c.userIds||[]).map(getUser).filter(Boolean);
+      await updateChatSummary(c);
       await Promise.all(users.map(updateOverview));
     }
   } finally {
@@ -730,6 +822,7 @@ function startUserActivity(chatId) {
       const current=getChat(chatId);
       if (current) {
         const users=(current.userIds||[]).map(getUser).filter(Boolean);
+        await updateChatSummary(current);
         await Promise.all(users.map(updateOverview));
       }
     } finally {
@@ -764,12 +857,19 @@ async function sendMessage() {
   if (!c || busy) return;
   const text=els.messageInput.value.trim();
   if (!text) return;
-  c.messages.push({id:uid("msg"),role:"human",content:text,createdAt:Date.now()});
+
+  const targets=mentionedUsers(text,c);
+  const replyTo=replyingToMessageId;
+  c.messages.push({id:uid("msg"),role:"human",content:text,replyTo:replyTo||null,createdAt:Date.now()});
   c.updatedAt=Date.now();
+  replyingToMessageId=null;
   els.messageInput.value="";
   autoResize();
   saveState(); render();
-  await respondAll();
+
+  const targetIds=targets.map(u=>u.id);
+  const extra=targets.length ? "The human explicitly mentioned you. Respond because you were directly addressed." : "";
+  await respondAll(extra,targetIds.length?targetIds:null);
   startUserActivity(c.id);
 }
 
@@ -794,6 +894,7 @@ els.editChatBtn.onclick=()=>{ const c=activeChat(); if(c) openChatEditor(c.id); 
 els.sendBtn.onclick=sendMessage;
 els.askAllBtn.textContent="Remember";
 els.askAllBtn.onclick=rememberNow;
+els.messageInput.placeholder="Message the chat… use @name to target someone";
 els.messageInput.addEventListener("input",autoResize);
 els.messageInput.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();} });
 
