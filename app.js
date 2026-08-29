@@ -122,7 +122,7 @@ function renderMarkdown(text="") {
   out=out.replace(/^# (.*)$/gm,'<h1>$1</h1>');
   out=out.replace(/^> (.*)$/gm,'<blockquote>$1</blockquote>');
   out=out.replace(/^[-*] (.*)$/gm,'<li>$1</li>');
-  out=out.replace(/(<li>.*<\\/li>\n?)+/g,m=>'<ul>'+m+'</ul>');
+  out=out.replace(/(<li>.*<\/li>\n?)+/g,m=>'<ul>'+m+'</ul>');
   out=out.replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');
   out=out.replace(/__(.*?)__/g,'<strong>$1</strong>');
   out=out.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g,'<em>$1</em>');
