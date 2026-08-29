@@ -228,7 +228,7 @@ function openUserEditor(userId=null) {
     '<button id="cancelUser" class="ghost">Cancel</button><button id="saveUser" class="primary">Save user</button></div>'
   );
 
-  $("cancelUser").onclick = openUsersModal;
+  $("cancelUser").onclick = () => { if (state.users.length) openUsersModal(); else closeModal(); };
   $("saveUser").onclick = () => {
     const name = $("userName").value.trim();
     const model = $("userModel").value.trim();
@@ -279,8 +279,8 @@ function openUsersModal() {
 }
 
 function openChatEditor(chatId=null) {
-  if (!state.users.length) return openUserEditor();
   const c = chatId ? getChat(chatId) : null;
+  if (!c && !state.users.length) return openUserEditor();
   showModal(
     '<h2>'+(c?'Edit chat':'New chat')+'</h2>' +
     '<div class="form-group"><label>Chat name</label><input id="chatName" maxlength="60" value="'+esc(c?.name||"")+'" placeholder="Group chat name"></div>' +
@@ -289,17 +289,21 @@ function openChatEditor(chatId=null) {
     '<button id="cancelChat" class="ghost">Cancel</button><button id="saveChat" class="primary">'+(c?'Save':'Create chat')+'</button></div>'
   );
   const list = $("memberList");
-  state.users.forEach(u => {
-    const label = document.createElement("label");
-    label.className = "pill";
-    label.innerHTML = '<input type="checkbox" value="'+esc(u.id)+'"'+(c?.userIds?.includes(u.id)?' checked':'')+'> '+esc(u.name);
-    list.appendChild(label);
-  });
+  if (!state.users.length) {
+    list.innerHTML = '<div class="muted">No AI users exist right now. You can still delete this chat.</div>';
+  } else {
+    state.users.forEach(u => {
+      const label = document.createElement("label");
+      label.className = "pill";
+      label.innerHTML = '<input type="checkbox" value="'+esc(u.id)+'"'+(c?.userIds?.includes(u.id)?' checked':'')+'> '+esc(u.name);
+      list.appendChild(label);
+    });
+  }
   $("cancelChat").onclick = closeModal;
   $("saveChat").onclick = () => {
     const name = $("chatName").value.trim() || "Untitled chat";
     const userIds = [...list.querySelectorAll("input:checked")].map(x=>x.value);
-    if (!userIds.length) return alert("Add at least one AI user.");
+    if (!c && !userIds.length) return alert("Add at least one AI user.");
     if (c) Object.assign(c,{name,userIds,updatedAt:Date.now()});
     else {
       const n={id:uid("chat"),name,userIds,messages:[],createdAt:Date.now(),updatedAt:Date.now()};
