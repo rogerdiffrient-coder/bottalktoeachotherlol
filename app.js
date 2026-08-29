@@ -13,6 +13,7 @@ let cloudModels = [];
 let busy = false;
 let replyingToMessageId = null;
 const chatActivityRunning = new Set();
+const activeActivityGeneration = new Map();
 const userFailureUntil = new Map();
 const ONE_MINUTE = 60 * 1000;
 const FIVE_MINUTES = 5 * 60 * 1000;
@@ -77,6 +78,7 @@ function loadState() {
       chats: Array.isArray(p.chats) ? p.chats : []
     };
     next.users.forEach(u => {
+      delete u.disabledReason;
       if (typeof u.overview !== "string") {
         u.overview = Array.isArray(u.memory) && u.memory.length ? u.memory.join(" ") : "";
       }
@@ -84,6 +86,9 @@ function loadState() {
     });
     next.chats.forEach(c => {
       c.messages = Array.isArray(c.messages) ? c.messages.filter(m => !(m.role==="assistant" && !String(m.content||"").trim())) : [];
+      c.messages.forEach(m=>{
+        if (!m.systemError && /^\[Ollama error:\s*HTTP\s*\d+\]$/i.test(String(m.content||"").trim())) m.legacyErrorLike=true;
+      });
       if (typeof c.summary !== "string") c.summary="";
       if (!Number.isInteger(c.summaryThrough)) c.summaryThrough=0;
     });
@@ -239,7 +244,7 @@ function renderActiveChat() {
   els.messages.innerHTML = "";
   (chat.messages||[]).forEach(msg => {
     const row = document.createElement("div");
-    row.className = "message" + (msg.role === "human" ? " me" : "");
+    row.className = "message" + (msg.role === "human" ? " me" : "") + (msg.systemError ? " system-error" : "");
     const user = msg.role === "assistant" ? getUser(msg.userId) : null;
     const name = msg.role === "human" ? "You" : (user?.name || msg.name || "AI");
     const avatar = msg.role === "human" ? "YOU" : initials(name);
@@ -478,6 +483,7 @@ async function checkOllama() {
 function allTranscriptLines() {
   const lines=[];
   state.chats.forEach(c => (c.messages||[]).forEach(m => {
+    if (m.systemError || m.legacyErrorLike) return;
     const speaker = m.role==="human" ? "You" : (getUser(m.userId)?.name || m.name || "AI");
     lines.push({chat:c.name||"Untitled",speaker,text:m.content||"",at:m.createdAt||0});
   }));
@@ -513,7 +519,7 @@ function buildSystem(u,c) {
 }
 
 function recentMessages(u,c) {
-  const exact=(c.messages||[]).slice(-18);
+  const exact=(c.messages||[]).filter(m=>!m.systemError && !m.legacyErrorLike).slice(-18);
   return exact.map(m => {
     const replied=getMessage(c,m.replyTo);
     const replyContext=replied ? " [replying to "+speakerForMessage(replied)+": "+splitGcThink(replied.content||"").visible.slice(0,220)+"]" : "";
@@ -589,7 +595,7 @@ async function callUser(u,c,extra="",onChunk=null) {
 }
 
 async function updateChatSummary(c) {
-  const messages=c.messages||[];
+  const messages=(c.messages||[]).filter(m=>!m.systemError && !m.legacyErrorLike);
   const keepRecent=18;
   const cutoff=Math.max(0,messages.length-keepRecent);
   if (cutoff<=0 || cutoff<=c.summaryThrough) return;
@@ -656,7 +662,6 @@ async function respondAll(extra="",targetUserIds=null) {
   busy=true; els.sendBtn.disabled=true;
   try {
     for (const u of users) {
-      if (u.disabledReason) continue;
       setTyping(u.name+" is thinking…");
       let liveMsg=null;
       try {
@@ -671,16 +676,14 @@ async function respondAll(extra="",targetUserIds=null) {
         liveMsg.content=text;
         delete liveMsg.streaming;
       } catch(e) {
-        const payment=disableUserForProviderError(u,e);
-        if (!payment) userFailureUntil.set(u.id,Date.now()+5*60*1000);
-        const errorText=payment
-          ? "[Ollama cloud rejected this model with HTTP 402. This user is paused until you Retry or change its model.]"
-          : "[Ollama error: "+e.message+"]";
+        userFailureUntil.set(u.id,Date.now()+5*60*1000);
+        const errorText="[Ollama error: "+e.message+"]";
         if (liveMsg) {
           liveMsg.content=errorText;
+          liveMsg.systemError=true;
           delete liveMsg.streaming;
         } else {
-          c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:errorText,createdAt:Date.now()});
+          c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:errorText,systemError:true,createdAt:Date.now()});
         }
       }
       c.updatedAt=Date.now(); saveState(); render();
@@ -701,7 +704,7 @@ function nextAutoUser(c) {
   for (let i=0;i<users.length;i++) {
     const user=users[c.autoCursor % users.length];
     c.autoCursor=(c.autoCursor+1)%users.length;
-    if (!user.disabledReason && (userFailureUntil.get(user.id)||0) <= Date.now()) return user;
+    if ((userFailureUntil.get(user.id)||0) <= Date.now()) return user;
   }
   return null;
 }
@@ -740,12 +743,10 @@ async function autoSpeakOnce(c) {
     liveMsg.content=text;
     delete liveMsg.streaming;
   } catch(e) {
-    const payment=disableUserForProviderError(u,e);
     const msg=String(e.message||"");
-    if (!payment) userFailureUntil.set(u.id,Date.now()+5*60*1000);
-    liveMsg.content=payment
-      ? "[Ollama cloud rejected this model with HTTP 402. Auto activity disabled until Retry/model change.]"
-      : "[Ollama error: "+msg+" — auto activity paused for this user for 5 minutes]";
+    userFailureUntil.set(u.id,Date.now()+5*60*1000);
+    liveMsg.content="[Ollama error: "+msg+"]";
+    liveMsg.systemError=true;
     delete liveMsg.streaming;
   }
 
@@ -792,42 +793,35 @@ async function runChatActivity(chatId,{durationMs=10000,maxTurns=2}={}) {
 
 function startUserActivity(chatId) {
   if (state.activeChatId!==chatId) return;
-  const c=getChat(chatId);
-  if (!c) return;
+  const generation=(activeActivityGeneration.get(chatId)||0)+1;
+  activeActivityGeneration.set(chatId,generation);
 
   (async()=>{
-    if (chatActivityRunning.has(chatId)) return;
-    chatActivityRunning.add(chatId);
-    const deadline=Date.now()+USER_ACTIVITY;
-    let turns=0;
-    try {
-      // The normal user message already caused immediate replies.
-      // Wait before any extra autonomous continuation.
-      await new Promise(resolve=>setTimeout(resolve,15000));
+    // Wait for actual silence. Any new human message increments the generation
+    // and cancels this pending continuation.
+    await new Promise(resolve=>setTimeout(resolve,30000));
+    if (activeActivityGeneration.get(chatId)!==generation) return;
+    if (state.activeChatId!==chatId) return;
 
-      while (Date.now()<deadline && turns<3 && state.activeChatId===chatId) {
-        const current=getChat(chatId);
-        if (!current) break;
-        const spoke=await autoSpeakOnce(current);
-        if (!spoke) break;
-        turns++;
+    const c=getChat(chatId);
+    if (!c) return;
 
-        if (turns<3 && Date.now()+20000<deadline) {
-          await new Promise(resolve=>setTimeout(resolve,20000));
-        } else {
-          break;
-        }
-      }
+    // One natural continuation after 30 seconds of silence.
+    await autoSpeakOnce(c);
 
-      const current=getChat(chatId);
-      if (current) {
-        const users=(current.userIds||[]).map(getUser).filter(Boolean);
-        await updateChatSummary(current);
-        await Promise.all(users.map(updateOverview));
-      }
-    } finally {
-      chatActivityRunning.delete(chatId);
-    }
+    // A second continuation can happen around the one-minute mark,
+    // but only if the human still hasn't said anything.
+    await new Promise(resolve=>setTimeout(resolve,30000));
+    if (activeActivityGeneration.get(chatId)!==generation) return;
+    if (state.activeChatId!==chatId) return;
+
+    const current=getChat(chatId);
+    if (!current) return;
+    await autoSpeakOnce(current);
+
+    await updateChatSummary(current);
+    const users=(current.userIds||[]).map(getUser).filter(Boolean);
+    await Promise.all(users.map(updateOverview));
   })();
 }
 
@@ -860,6 +854,7 @@ async function sendMessage() {
 
   const targets=mentionedUsers(text,c);
   const replyTo=replyingToMessageId;
+  activeActivityGeneration.set(c.id,(activeActivityGeneration.get(c.id)||0)+1);
   c.messages.push({id:uid("msg"),role:"human",content:text,replyTo:replyTo||null,createdAt:Date.now()});
   c.updatedAt=Date.now();
   replyingToMessageId=null;
