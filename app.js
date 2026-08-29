@@ -267,9 +267,11 @@ function openUsersModal() {
   state.users.forEach(u => {
     const card = document.createElement("div");
     card.className = "user-card";
-    card.innerHTML = '<div><strong>'+esc(u.name)+'</strong><small>'+esc(u.model||"No model")+' · '+(u.overview?'has remembrance':'no remembrance yet')+'</small></div><div class="row"><button class="ghost overview">Remembrance</button><button class="ghost edit">Edit</button></div>';
+    card.innerHTML = '<div><strong>'+esc(u.name)+'</strong><small>'+esc(u.model||"No model")+' · '+(u.overview?'has remembrance':'no remembrance yet')+'</small></div><div class="row"><button class="ghost overview">Remembrance</button><button class="ghost reset-memory">Reset memory</button><button class="ghost edit">Edit</button><button class="ghost danger delete-user">Delete</button></div>';
     card.querySelector(".edit").onclick = ()=>openUserEditor(u.id);
     card.querySelector(".overview").onclick = ()=>openOverview(u.id);
+    card.querySelector(".reset-memory").onclick = ()=>{ if(confirm("Reset "+u.name+"'s remembrance?")){ u.overview=""; saveState(); openUsersModal(); } };
+    card.querySelector(".delete-user").onclick = ()=>{ if(confirm("Delete "+u.name+"?")){ state.users=state.users.filter(x=>x.id!==u.id); state.chats.forEach(c=>c.userIds=(c.userIds||[]).filter(id=>id!==u.id)); saveState(); render(); openUsersModal(); } };
     root.appendChild(card);
   });
   $("closeUsers").onclick = closeModal;
@@ -416,18 +418,55 @@ function recentMessages(u,c) {
 }
 
 async function rawChat(model,messages,opts={}) {
+  const useStream = opts.stream !== false;
   const r = await fetch(state.settings.baseUrl.replace(/\/$/,"")+"/api/chat", {
     method:"POST",
     headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({model,stream:false,messages,options:{temperature:opts.temperature ?? 0.8}, ...(opts.format?{format:opts.format}:{})})
+    body:JSON.stringify({model,stream:useStream,messages,options:{temperature:opts.temperature ?? 0.8}, ...(opts.format?{format:opts.format}:{})})
   });
   if (!r.ok) throw new Error("HTTP "+r.status);
-  const d=await r.json();
-  return (d.message?.content||"").trim();
+
+  if (!useStream || !r.body) {
+    const d=await r.json();
+    return (d.message?.content||"").trim();
+  }
+
+  const reader=r.body.getReader();
+  const decoder=new TextDecoder();
+  let buffer="", full="";
+  while (true) {
+    const {value,done}=await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value,{stream:true});
+    const lines=buffer.split("\n");
+    buffer=lines.pop()||"";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const d=JSON.parse(line);
+        const chunk=d.message?.content||"";
+        if (chunk) {
+          full+=chunk;
+          if (typeof opts.onChunk==="function") opts.onChunk(full,chunk);
+        }
+      } catch {}
+    }
+  }
+  if (buffer.trim()) {
+    try {
+      const d=JSON.parse(buffer);
+      const chunk=d.message?.content||"";
+      if (chunk) {
+        full+=chunk;
+        if (typeof opts.onChunk==="function") opts.onChunk(full,chunk);
+      }
+    } catch {}
+  }
+  return full.trim();
 }
 
-async function callUser(u,c,extra="") {
-  let out=await rawChat(u.model,[{role:"system",content:buildSystem(u,c)+(extra?"\n\n"+extra:"")},...recentMessages(u,c)]);
+async function callUser(u,c,extra="",onChunk=null) {
+  let out=await rawChat(u.model,[{role:"system",content:buildSystem(u,c)+(extra?"\n\n"+extra:"")},...recentMessages(u,c)],{onChunk});
   const match=out.match(/^\[\[REMEMBER:\s*(.*?)\s*\]\]$/i);
   if (match) {
     const found=searchAllChats(match[1],28);
@@ -454,7 +493,7 @@ async function updateOverview(u) {
     "Do not make a bullet list of atomic facts. Keep useful context, drop trivial details, and do not invent anything.\n\n" +
     "Previous overview:\n"+(u.overview||"(none)")+"\n\nRecent conversation history:\n"+transcript;
   try {
-    u.overview=await rawChat(u.model,[{role:"user",content:prompt}],{temperature:0.2});
+    u.overview=await rawChat(u.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false});
     saveState();
   } catch(e) { console.warn("Overview update failed",e); }
 }
@@ -474,8 +513,12 @@ async function respondAll(extra="") {
     for (const u of users) {
       setTyping(u.name+" is thinking…");
       try {
-        const text=await callUser(u,c,extra);
-        if (text) c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:text,createdAt:Date.now()});
+        const liveMsg={id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"",createdAt:Date.now(),streaming:true};
+        c.messages.push(liveMsg);
+        saveState(); render();
+        const text=await callUser(u,c,extra,(full)=>{ liveMsg.content=full; saveState(); renderActiveChat(); });
+        liveMsg.content=text;
+        delete liveMsg.streaming;
       } catch(e) {
         c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"[Ollama error: "+e.message+"]",createdAt:Date.now()});
       }
@@ -517,6 +560,7 @@ $("newChatBtn").onclick=()=>openChatEditor();
 $("emptyNewChatBtn").onclick=()=>openChatEditor();
 $("manageUsersBtn").onclick=openUsersModal;
 $("settingsBtn").onclick=openSettings;
+els.editChatBtn.textContent="Chat settings";
 els.editChatBtn.onclick=()=>{ const c=activeChat(); if(c) openChatEditor(c.id); };
 els.sendBtn.onclick=sendMessage;
 els.askAllBtn.textContent="Remember";
