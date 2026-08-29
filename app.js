@@ -509,7 +509,7 @@ function cleanContextMessages(c) {
 function currentTopicText(c) {
   const recent=cleanContextMessages(c).slice(-6);
   if (!recent.length) return "(No recent topic yet.)";
-  return recent.map(m=>speakerForMessage(m)+": "+splitGcThink(m.content||"").visible).join("\n");
+  return recent.map(m=>"[SPEAKER = "+speakerForMessage(m)+"]\n"+splitGcThink(m.content||"").visible).join("\n\n");
 }
 
 function normalizedText(s="") {
@@ -536,7 +536,7 @@ function buildSystem(u,c) {
     "You are "+u.name+", a participant in a casual group chat.",
     u.personality ? "Your personality:\n"+u.personality : "",
     "Participants: "+participants+".",
-    "Reply only as "+u.name+". Do not write dialogue for anyone else and do not prefix replies with your name.",
+    "You are "+u.name+" and ONLY "+u.name+". Never speak as, impersonate, or continue dialogue for another participant. Never begin with another participant name followed by a colon. Do not label your own reply with any speaker name.",
     "RELEVANCE RULES:",
     "- The CURRENT TOPIC and exact recent messages matter most.",
     "- Reply to what was said most recently unless someone directly asked about an older topic.",
@@ -556,13 +556,17 @@ function buildSystem(u,c) {
 function recentMessages(u,c) {
   const exact=cleanContextMessages(c).slice(-12);
   return exact.map(m => {
+    const speaker=speakerForMessage(m);
     const replied=getMessage(c,m.replyTo);
-    const replyContext=replied ? " [replying to "+speakerForMessage(replied)+": "+splitGcThink(replied.content||"").visible.slice(0,220)+"]" : "";
-    if (m.role==="human") return {role:"user",content:"You"+replyContext+": "+m.content};
-    const speaker=getUser(m.userId)?.name||m.name||"AI";
-    return m.userId===u.id
-      ? {role:"assistant",content:(replyContext?replyContext+" ":"")+m.content}
-      : {role:"user",content:speaker+replyContext+": "+m.content};
+    const replyContext=replied
+      ? " (replying to "+speakerForMessage(replied)+": "+splitGcThink(replied.content||"").visible.slice(0,220)+")"
+      : "";
+
+    if (m.role==="assistant" && m.userId===u.id) {
+      return {role:"assistant",content:"[YOU = "+u.name+"]"+replyContext+"\n"+m.content};
+    }
+
+    return {role:"user",content:"[SPEAKER = "+speaker+"]"+replyContext+"\n"+m.content};
   });
 }
 
@@ -794,7 +798,7 @@ async function autoSpeakOnce(c) {
     const text=await callUser(
       u,
       c,
-      "Continue the CURRENT conversation naturally. Focus on the most recent 1-3 messages. Do not revive an older topic or running joke unless the latest messages clearly connect to it. If you have nothing genuinely relevant to add, output exactly [[PASS]]. Do not mention that this is automatic/background activity.",
+      "Continue the CURRENT conversation naturally as "+u.name+" only. Focus on the most recent 1-3 messages. Never imitate another participant or write their name as a speaker label. Do not revive an older topic or running joke unless the latest messages clearly connect to it. If you have nothing genuinely relevant to add, output exactly [[PASS]]. Do not mention that this is automatic/background activity.",
       (full)=>{
         liveMsg.content=full;
         saveState();
