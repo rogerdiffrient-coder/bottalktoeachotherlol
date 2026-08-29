@@ -113,6 +113,39 @@ function renderChatList() {
   });
 }
 
+function renderMarkdown(text="") {
+  let out=esc(text);
+  out=out.replace(/\`\`\`([\s\S]*?)\`\`\`/g, (_,code)=>'<pre><code>'+code+'</code></pre>');
+  out=out.replace(/\`([^\`]+)\`/g,'<code>$1</code>');
+  out=out.replace(/^### (.*)$/gm,'<h3>$1</h3>');
+  out=out.replace(/^## (.*)$/gm,'<h2>$1</h2>');
+  out=out.replace(/^# (.*)$/gm,'<h1>$1</h1>');
+  out=out.replace(/^> (.*)$/gm,'<blockquote>$1</blockquote>');
+  out=out.replace(/^[-*] (.*)$/gm,'<li>$1</li>');
+  out=out.replace(/(<li>.*<\\/li>\n?)+/g,m=>'<ul>'+m+'</ul>');
+  out=out.replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>');
+  out=out.replace(/__(.*?)__/g,'<strong>$1</strong>');
+  out=out.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g,'<em>$1</em>');
+  out=out.replace(/(?<!_)_([^_\n]+)_(?!_)/g,'<em>$1</em>');
+  out=out.replace(/~~(.*?)~~/g,'<del>$1</del>');
+  out=out.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  out=out.replace(/\n/g,'<br>');
+  return out;
+}
+
+function splitGcThink(text="") {
+  const notes=[];
+  const visible=String(text).replace(/<gcthink>([\s\S]*?)<\/gcthink>/gi,(_,t)=>{notes.push(t.trim());return "";}).trim();
+  return {visible,notes};
+}
+
+function messageContentHtml(text="") {
+  const parts=splitGcThink(text);
+  let html=parts.notes.map(t=>'<details class="thinking"><summary>Thought summary</summary><div class="thinking-body">'+renderMarkdown(t)+'</div></details>').join("");
+  html += '<div class="rendered-markdown">'+renderMarkdown(parts.visible)+'</div>';
+  return html;
+}
+
 function renderActiveChat() {
   const chat = activeChat();
   if (!chat) {
@@ -144,7 +177,7 @@ function renderActiveChat() {
       '<div class="avatar">'+esc(avatar)+'</div>' +
       '<div><div class="message-head"><span class="message-name">'+esc(name)+'</span>' +
       '<span class="message-time">'+esc(time)+'</span></div>' +
-      '<div class="message-body">'+esc(msg.content||"")+'</div></div>';
+      '<div class="message-body">'+messageContentHtml(msg.content||"")+'</div></div>';
     els.messages.appendChild(row);
   });
   requestAnimationFrame(()=>els.messages.scrollTop = els.messages.scrollHeight);
@@ -369,6 +402,7 @@ function buildSystem(u,c) {
     "Participants: "+participants+".",
     "Reply only as "+u.name+". Do not write dialogue for anyone else and do not prefix replies with your name.",
     "Your remembrance is a broad rolling overview, not a list of isolated facts:\n"+(u.overview||"(No overview yet.)"),
+    "If you want to show a brief user-visible thought summary, put it in <gcthink>...</gcthink>. Keep it concise and high-level. Never use ordinary <think> tags.",
     "You have a Remember tool. If you need a specific detail from any earlier chat that is not clear in the overview, output exactly [[REMEMBER: search words]] and nothing else. The app will search all chats and give you matching history, then you can answer normally."
   ].filter(Boolean).join("\n\n");
 }
