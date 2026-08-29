@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ollama GC</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">◉</div>
+        <div>
+          <h1>Ollama GC</h1>
+          <p>local AI group chats</p>
+        </div>
+      </div>
+
+      <button id="newChatBtn" class="primary wide">+ New chat</button>
+
+      <div class="section-title">
+        <span>Chats</span>
+      </div>
+      <div id="chatList" class="chat-list"></div>
+
+      <div class="sidebar-footer">
+        <button id="manageUsersBtn" class="ghost wide">Manage users</button>
+        <button id="settingsBtn" class="ghost wide">Settings</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h2 id="chatTitle">Ollama GC</h2>
+          <div id="chatSubtitle" class="muted">Create a chat to get started.</div>
+        </div>
+        <div class="top-actions">
+          <span id="ollamaStatus" class="status offline">Ollama offline</span>
+          <button id="editChatBtn" class="ghost hidden">Edit chat</button>
+        </div>
+      </header>
+
+      <section id="emptyState" class="empty-state">
+        <div class="empty-icon">💬</div>
+        <h2>Make some local AIs talk.</h2>
+        <p>Create users with their own names, models, and personalities, then put one or more of them in a chat.</p>
+        <button id="emptyNewChatBtn" class="primary">Create a chat</button>
+      </section>
+
+      <section id="chatView" class="chat-view hidden">
+        <div id="messages" class="messages"></div>
+        <div id="typingBar" class="typing-bar hidden"></div>
+
+        <div class="composer-wrap">
+          <div class="composer">
+            <textarea id="messageInput" rows="1" placeholder="Message the chat..."></textarea>
+            <button id="sendBtn" class="send-btn" title="Send">➤</button>
+          </div>
+          <div class="composer-meta">
+            <span>Enter to send · Shift+Enter for newline</span>
+            <button id="askAllBtn" class="link-btn">Ask everyone</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modalBackdrop" class="modal-backdrop hidden">
+    <div id="modal" class="modal"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
