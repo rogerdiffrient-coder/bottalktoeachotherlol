@@ -533,11 +533,23 @@ function recentMessages(u,c) {
 
 async function rawChat(model,messages,opts={}) {
   const useStream = opts.stream !== false;
-  const r = await fetch(state.settings.baseUrl.replace(/\/$/,"")+"/api/chat", {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({model,stream:useStream,messages,options:{temperature:opts.temperature ?? 0.8}, ...(opts.format?{format:opts.format}:{})})
-  });
+  const controller=new AbortController();
+  const timeoutMs=opts.timeoutMs ?? (useStream ? 60000 : 20000);
+  const timeout=setTimeout(()=>controller.abort(),timeoutMs);
+  let r;
+  try {
+    r = await fetch(state.settings.baseUrl.replace(/\/$/,"")+"/api/chat", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      signal:controller.signal,
+      body:JSON.stringify({model,stream:useStream,messages,options:{temperature:opts.temperature ?? 0.8}, ...(opts.format?{format:opts.format}:{})})
+    });
+  } catch(e) {
+    clearTimeout(timeout);
+    if (e?.name==="AbortError") throw new Error("Request timed out");
+    throw e;
+  }
+  clearTimeout(timeout);
   if (!r.ok) throw new Error("HTTP "+r.status);
 
   if (!useStream || !r.body) {
@@ -612,7 +624,7 @@ async function updateChatSummary(c) {
     "Existing summary:\n"+(c.summary||"(none)")+"\n\nMessages to fold into the summary:\n"+transcript;
 
   try {
-    c.summary=await rawChat(summarizer.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false});
+    c.summary=await rawChat(summarizer.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
     c.summaryThrough=cutoff;
     saveState();
   } catch(e) { console.warn("Chat summary update failed",e); }
@@ -631,9 +643,20 @@ async function updateOverview(u) {
     "Do not make a bullet list of atomic facts. Keep useful context, drop trivial details, and do not invent anything.\n\n" +
     "Previous overview:\n"+(u.overview||"(none)")+"\n\nRecent conversation history:\n"+transcript;
   try {
-    u.overview=await rawChat(u.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false});
+    u.overview=await rawChat(u.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
     saveState();
   } catch(e) { console.warn("Overview update failed",e); }
+}
+
+function updateContextInBackground(c,users) {
+  (async()=>{
+    try {
+      await updateChatSummary(c);
+      await Promise.allSettled(users.map(updateOverview));
+    } catch(e) {
+      console.warn("Background context update failed",e);
+    }
+  })();
 }
 
 function setTyping(t="") {
@@ -688,9 +711,7 @@ async function respondAll(extra="",targetUserIds=null) {
       }
       c.updatedAt=Date.now(); saveState(); render();
     }
-    setTyping("Updating context…");
-    await updateChatSummary(c);
-    await Promise.all(users.map(updateOverview));
+    updateContextInBackground(c,users);
   } finally {
     busy=false; els.sendBtn.disabled=false; setTyping("");
   }
@@ -783,8 +804,7 @@ async function runChatActivity(chatId,{durationMs=10000,maxTurns=2}={}) {
     const c=getChat(chatId);
     if (c) {
       const users=(c.userIds||[]).map(getUser).filter(Boolean);
-      await updateChatSummary(c);
-      await Promise.all(users.map(updateOverview));
+      updateContextInBackground(c,users);
     }
   } finally {
     chatActivityRunning.delete(chatId);
