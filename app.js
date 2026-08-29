@@ -13,6 +13,7 @@ let cloudModels = [];
 let busy = false;
 const chatActivityUntil = new Map();
 const chatActivityRunning = new Set();
+const userFailureUntil = new Map();
 const FIVE_MINUTES = 5 * 60 * 1000;
 const SHORT_ACTIVITY = 10 * 1000;
 const USER_ACTIVITY = 60 * 1000;
@@ -80,6 +81,9 @@ function loadState() {
         u.overview = Array.isArray(u.memory) && u.memory.length ? u.memory.join(" ") : "";
       }
       delete u.memory;
+    });
+    next.chats.forEach(c => {
+      c.messages = Array.isArray(c.messages) ? c.messages.filter(m => !(m.role==="assistant" && !String(m.content||"").trim())) : [];
     });
     return next;
   } catch (e) {
@@ -534,6 +538,7 @@ async function respondAll(extra="") {
         liveMsg.content=text;
         delete liveMsg.streaming;
       } catch(e) {
+        userFailureUntil.set(u.id,Date.now()+5*60*1000);
         if (liveMsg) {
           liveMsg.content="[Ollama error: "+e.message+"]";
           delete liveMsg.streaming;
@@ -554,9 +559,13 @@ function nextAutoUser(c) {
   const users=(c.userIds||[]).map(getUser).filter(Boolean);
   if (!users.length) return null;
   c.autoCursor = Number.isInteger(c.autoCursor) ? c.autoCursor : 0;
-  const user=users[c.autoCursor % users.length];
-  c.autoCursor=(c.autoCursor+1)%users.length;
-  return user;
+
+  for (let i=0;i<users.length;i++) {
+    const user=users[c.autoCursor % users.length];
+    c.autoCursor=(c.autoCursor+1)%users.length;
+    if ((userFailureUntil.get(user.id)||0) <= Date.now()) return user;
+  }
+  return null;
 }
 
 async function autoSpeakOnce(c) {
@@ -593,7 +602,9 @@ async function autoSpeakOnce(c) {
     liveMsg.content=text;
     delete liveMsg.streaming;
   } catch(e) {
-    liveMsg.content="[Ollama error: "+e.message+"]";
+    const msg=String(e.message||"");
+    userFailureUntil.set(u.id,Date.now()+5*60*1000);
+    liveMsg.content="[Ollama error: "+msg+" — auto activity paused for this user for 5 minutes]";
     delete liveMsg.streaming;
   }
 
@@ -608,16 +619,19 @@ async function runChatActivity(chatId) {
   if (chatActivityRunning.has(chatId)) return;
   chatActivityRunning.add(chatId);
   try {
-    while (Date.now() < (chatActivityUntil.get(chatId)||0)) {
+    let turns=0;
+    while (Date.now() < (chatActivityUntil.get(chatId)||0) && turns < 4) {
       const c=getChat(chatId);
       if (!c) break;
       const hasUsers=(c.userIds||[]).some(id=>getUser(id));
       if (!hasUsers) break;
 
-      await autoSpeakOnce(c);
+      const spoke=await autoSpeakOnce(c);
+      if (!spoke) break;
+      turns++;
 
-      // Tiny pause so one fast local model cannot flood a chat instantly.
-      await new Promise(resolve=>setTimeout(resolve,700));
+      // Natural pacing instead of machine-gun replies.
+      await new Promise(resolve=>setTimeout(resolve,2500));
     }
 
     const c=getChat(chatId);
@@ -627,7 +641,6 @@ async function runChatActivity(chatId) {
     }
   } finally {
     chatActivityRunning.delete(chatId);
-    if (Date.now() < (chatActivityUntil.get(chatId)||0)) runChatActivity(chatId);
   }
 }
 
