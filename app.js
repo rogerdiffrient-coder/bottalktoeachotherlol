@@ -15,6 +15,7 @@ let replyingToMessageId = null;
 const chatActivityRunning = new Set();
 const activeActivityGeneration = new Map();
 const userFailureUntil = new Map();
+const cloudModelBlockedUntil = new Map();
 const ONE_MINUTE = 60 * 1000;
 const FIVE_MINUTES = 5 * 60 * 1000;
 const USER_ACTIVITY = 60 * 1000;
@@ -324,6 +325,7 @@ function openUserEditor(userId=null) {
       if (modelChanged) {
         delete u.disabledReason;
         userFailureUntil.delete(u.id);
+        cloudModelBlockedUntil.delete(u.model);
       }
     } else {
       state.users.push({id:uid("user"),name,model,personality,overview:"",createdAt:Date.now()});
@@ -468,7 +470,8 @@ async function checkOllama() {
     if (!r.ok) throw new Error("HTTP "+r.status);
     const d = await r.json();
     installedModels=(d.models||[]).map(m=>m.name).filter(Boolean);
-    els.ollamaStatus.textContent="Ollama connected · "+installedModels.length+" local · "+cloudModels.length+" cloud";
+    const blocked=[...cloudModelBlockedUntil.values()].filter(t=>t>Date.now()).length;
+    els.ollamaStatus.textContent="Ollama connected · "+installedModels.length+" local · "+cloudModels.length+" cloud"+(blocked?" · "+blocked+" cloud fallback active":"");
     els.ollamaStatus.classList.remove("offline");
     return true;
   } catch(e) {
@@ -630,13 +633,54 @@ async function rawChat(model,messages,opts={}) {
   return full.trim();
 }
 
+function isCloudModelName(model="") {
+  return model.endsWith(":cloud") || model.endsWith("-cloud");
+}
+
+function modelFamily(model="") {
+  return String(model)
+    .replace(/:cloud$/,"")
+    .replace(/-cloud$/,"")
+    .split(":")[0]
+    .toLowerCase();
+}
+
+function chooseLocalFallback(preferredModel="") {
+  const locals=installedModels.filter(m=>m && !isCloudModelName(m));
+  if (!locals.length) return "";
+
+  const family=modelFamily(preferredModel);
+  const sameFamily=locals.find(m=>modelFamily(m)===family);
+  return sameFamily || locals[0];
+}
+
+async function rawChatWithFallback(preferredModel,messages,opts={}) {
+  const blockedUntil=cloudModelBlockedUntil.get(preferredModel)||0;
+  const fallback=chooseLocalFallback(preferredModel);
+
+  if (isCloudModelName(preferredModel) && blockedUntil>Date.now() && fallback) {
+    return rawChat(fallback,messages,opts);
+  }
+
+  try {
+    return await rawChat(preferredModel,messages,opts);
+  } catch(e) {
+    if (!isPaymentError(e) || !isCloudModelName(preferredModel) || !fallback) throw e;
+
+    // Avoid repeatedly slamming a cloud model that is currently rejecting requests.
+    cloudModelBlockedUntil.set(preferredModel,Date.now()+30*60*1000);
+    console.warn("Cloud model returned HTTP 402; falling back locally:",preferredModel,"->",fallback);
+    return rawChat(fallback,messages,opts);
+  }
+}
+
 async function callUser(u,c,extra="",onChunk=null) {
-  let out=await rawChat(u.model,[{role:"system",content:buildSystem(u,c)+(extra?"\n\n"+extra:"")},...recentMessages(u,c)],{onChunk});
+  let out=await rawChatWithFallback(u.model,[{role:"system",content:buildSystem(u,c)+(extra?"\n\n"+extra:"")},...recentMessages(u,c)],{onChunk});
   const match=out.match(/^\[\[REMEMBER:\s*(.*?)\s*\]\]$/i);
   if (match) {
     const found=searchAllChats(match[1],28);
     const memoryText=found.length ? found.map(x=>"["+x.chat+"] "+x.speaker+": "+x.text).join("\n") : "(No matching history found.)";
-    out=await rawChat(u.model,[
+    out=await rawChatWithFallback(u.model,[
       {role:"system",content:buildSystem(u,c)},
       ...recentMessages(u,c),
       {role:"user",content:"Remember search results for \""+match[1]+"\":\n"+memoryText+"\n\nNow answer the current conversation normally."}
@@ -663,7 +707,7 @@ async function updateChatSummary(c) {
     "Existing summary:\n"+(c.summary||"(none)")+"\n\nMessages to fold into the summary:\n"+transcript;
 
   try {
-    c.summary=await rawChat(summarizer.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
+    c.summary=await rawChatWithFallback(summarizer.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
     c.summaryThrough=cutoff;
     saveState();
   } catch(e) { console.warn("Chat summary update failed",e); }
@@ -682,7 +726,7 @@ async function updateOverview(u) {
     "Do not preserve temporary errors, one-off jokes, repetitive filler, or stale topics just because they appeared many times. Do not make a bullet list of atomic facts. Keep useful context, drop trivial details, and do not invent anything.\n\n" +
     "Previous overview:\n"+(u.overview||"(none)")+"\n\nRecent conversation history:\n"+transcript;
   try {
-    u.overview=await rawChat(u.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
+    u.overview=await rawChatWithFallback(u.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
     saveState();
   } catch(e) { console.warn("Overview update failed",e); }
 }
