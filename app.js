@@ -11,11 +11,10 @@ let state = loadState();
 let installedModels = [];
 let cloudModels = [];
 let busy = false;
-const chatActivityUntil = new Map();
 const chatActivityRunning = new Set();
 const userFailureUntil = new Map();
+const ONE_MINUTE = 60 * 1000;
 const FIVE_MINUTES = 5 * 60 * 1000;
-const SHORT_ACTIVITY = 10 * 1000;
 const USER_ACTIVITY = 60 * 1000;
 
 const FALLBACK_CLOUD_MODELS = [
@@ -98,6 +97,23 @@ function getChat(id) { return state.chats.find(c => c.id === id) || null; }
 function activeChat() { return getChat(state.activeChatId); }
 function initials(name) { return (name||"?").trim().split(/\s+/).map(x=>x[0]).join("").slice(0,2).toUpperCase(); }
 
+function markChatLeft(chatId) {
+  const c=getChat(chatId);
+  if (!c) return;
+  c.nextAutoAt=Date.now()+ONE_MINUTE;
+  saveState();
+}
+
+function selectChat(chatId) {
+  const previousId=state.activeChatId;
+  if (previousId && previousId!==chatId) markChatLeft(previousId);
+  state.activeChatId=chatId;
+  const c=getChat(chatId);
+  if (c) c.nextAutoAt=null;
+  saveState();
+  render();
+}
+
 function render() {
   renderChatList();
   renderActiveChat();
@@ -113,11 +129,7 @@ function renderChatList() {
     const b = document.createElement("button");
     b.className = "chat-item" + (chat.id === state.activeChatId ? " active" : "");
     b.textContent = chat.name || "Untitled chat";
-    b.addEventListener("click", () => {
-      state.activeChatId = chat.id;
-      saveState();
-      render();
-    });
+    b.addEventListener("click", () => selectChat(chat.id));
     els.chatList.appendChild(b);
   });
 }
@@ -315,15 +327,23 @@ function openChatEditor(chatId=null) {
     if (!c && !userIds.length) return alert("Add at least one AI user.");
     if (c) Object.assign(c,{name,userIds,updatedAt:Date.now()});
     else {
-      const n={id:uid("chat"),name,userIds,messages:[],createdAt:Date.now(),updatedAt:Date.now()};
-      state.chats.push(n); state.activeChatId=n.id;
+      const previousId=state.activeChatId;
+      const n={id:uid("chat"),name,userIds,messages:[],createdAt:Date.now(),updatedAt:Date.now(),nextAutoAt:null};
+      state.chats.push(n);
+      if (previousId && previousId!==n.id) markChatLeft(previousId);
+      state.activeChatId=n.id;
     }
     saveState(); closeModal(); render();
   };
   if (c) $("deleteChat").onclick = () => {
     if (!confirm("Delete this chat?")) return;
+    const wasActive=state.activeChatId===c.id;
     state.chats = state.chats.filter(x=>x.id!==c.id);
-    if (state.activeChatId===c.id) state.activeChatId=state.chats[0]?.id||null;
+    if (wasActive) {
+      state.activeChatId=state.chats[0]?.id||null;
+      const next=activeChat();
+      if (next) next.nextAutoAt=null;
+    }
     saveState(); closeModal(); render();
   };
 }
@@ -615,23 +635,27 @@ async function autoSpeakOnce(c) {
   return true;
 }
 
-async function runChatActivity(chatId) {
+async function runChatActivity(chatId,{durationMs=10000,maxTurns=2}={}) {
   if (chatActivityRunning.has(chatId)) return;
+  if (state.activeChatId===chatId) return;
+
   chatActivityRunning.add(chatId);
+  const deadline=Date.now()+durationMs;
+
   try {
     let turns=0;
-    while (Date.now() < (chatActivityUntil.get(chatId)||0) && turns < 4) {
+    while (Date.now()<deadline && turns<maxTurns) {
       const c=getChat(chatId);
-      if (!c) break;
-      const hasUsers=(c.userIds||[]).some(id=>getUser(id));
-      if (!hasUsers) break;
+      if (!c || state.activeChatId===chatId) break;
+      if (!(c.userIds||[]).some(id=>getUser(id))) break;
 
       const spoke=await autoSpeakOnce(c);
       if (!spoke) break;
       turns++;
 
-      // Natural pacing instead of machine-gun replies.
-      await new Promise(resolve=>setTimeout(resolve,2500));
+      if (turns<maxTurns && Date.now()<deadline) {
+        await new Promise(resolve=>setTimeout(resolve,3000));
+      }
     }
 
     const c=getChat(chatId);
@@ -644,17 +668,59 @@ async function runChatActivity(chatId) {
   }
 }
 
-function startChatActivity(chatId,durationMs) {
-  const until=Date.now()+durationMs;
-  chatActivityUntil.set(chatId,Math.max(chatActivityUntil.get(chatId)||0,until));
-  runChatActivity(chatId);
+function startUserActivity(chatId) {
+  if (state.activeChatId!==chatId) return;
+  const c=getChat(chatId);
+  if (!c) return;
+
+  // User-triggered activity is intentionally longer and chattier.
+  (async()=>{
+    if (chatActivityRunning.has(chatId)) return;
+    chatActivityRunning.add(chatId);
+    const deadline=Date.now()+USER_ACTIVITY;
+    let turns=0;
+    try {
+      while (Date.now()<deadline && turns<5 && state.activeChatId===chatId) {
+        const current=getChat(chatId);
+        if (!current) break;
+        const spoke=await autoSpeakOnce(current);
+        if (!spoke) break;
+        turns++;
+        if (turns<5 && Date.now()<deadline) {
+          await new Promise(resolve=>setTimeout(resolve,8000));
+        }
+      }
+      const current=getChat(chatId);
+      if (current) {
+        const users=(current.userIds||[]).map(getUser).filter(Boolean);
+        await Promise.all(users.map(updateOverview));
+      }
+    } finally {
+      chatActivityRunning.delete(chatId);
+    }
+  })();
 }
 
-function pulseAllChats() {
-  state.chats.forEach(c=>startChatActivity(c.id,SHORT_ACTIVITY));
+async function backgroundSchedulerTick() {
+  const now=Date.now();
+
+  for (const c of state.chats) {
+    if (c.id===state.activeChatId) continue;
+    if (!c.nextAutoAt) continue;
+    if (c.nextAutoAt>now) continue;
+    if (chatActivityRunning.has(c.id)) continue;
+
+    // Schedule the NEXT pulse first so one failure cannot cause rapid retries.
+    c.nextAutoAt=now+FIVE_MINUTES;
+    saveState();
+
+    // A background pulse is small: only 1-2 messages.
+    const maxTurns=Math.random()<0.5 ? 1 : 2;
+    runChatActivity(c.id,{durationMs:10000,maxTurns});
+  }
 }
 
-setInterval(pulseAllChats,FIVE_MINUTES);
+setInterval(backgroundSchedulerTick,5000);
 
 async function sendMessage() {
   const c=activeChat();
@@ -667,7 +733,7 @@ async function sendMessage() {
   autoResize();
   saveState(); render();
   await respondAll();
-  startChatActivity(c.id,USER_ACTIVITY);
+  startUserActivity(c.id);
 }
 
 async function rememberNow() {
