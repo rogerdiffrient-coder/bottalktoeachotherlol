@@ -256,8 +256,16 @@ function openUserEditor(userId=null) {
     const personality = $("userPersonality").value.trim();
     if (!name) return alert("Give the user a name.");
     if (!model) return alert("Pick an Ollama model.");
-    if (u) Object.assign(u,{name,model,personality});
-    else state.users.push({id:uid("user"),name,model,personality,overview:"",createdAt:Date.now()});
+    if (u) {
+      const modelChanged=u.model!==model;
+      Object.assign(u,{name,model,personality});
+      if (modelChanged) {
+        delete u.disabledReason;
+        userFailureUntil.delete(u.id);
+      }
+    } else {
+      state.users.push({id:uid("user"),name,model,personality,overview:"",createdAt:Date.now()});
+    }
     saveState(); render(); openUsersModal();
   };
   if (u) $("deleteUser").onclick = () => {
@@ -288,10 +296,12 @@ function openUsersModal() {
   state.users.forEach(u => {
     const card = document.createElement("div");
     card.className = "user-card";
-    card.innerHTML = '<div><strong>'+esc(u.name)+'</strong><small>'+esc(u.model||"No model")+' · '+(u.overview?'has remembrance':'no remembrance yet')+'</small></div><div class="row"><button class="ghost overview">Remembrance</button><button class="ghost reset-memory">Reset memory</button><button class="ghost edit">Edit</button><button class="ghost danger delete-user">Delete</button></div>';
+    card.innerHTML = '<div><strong>'+esc(u.name)+'</strong><small>'+esc(u.model||"No model")+' · '+(u.disabledReason?('disabled: '+u.disabledReason):(u.overview?'has remembrance':'no remembrance yet'))+'</small></div><div class="row"><button class="ghost overview">Remembrance</button><button class="ghost reset-memory">Reset memory</button>'+(u.disabledReason?'<button class="ghost retry-user">Retry</button>':'')+'<button class="ghost edit">Edit</button><button class="ghost danger delete-user">Delete</button></div>';
     card.querySelector(".edit").onclick = ()=>openUserEditor(u.id);
     card.querySelector(".overview").onclick = ()=>openOverview(u.id);
     card.querySelector(".reset-memory").onclick = ()=>{ if(confirm("Reset "+u.name+"'s remembrance?")){ u.overview=""; saveState(); openUsersModal(); } };
+    const retryBtn=card.querySelector(".retry-user");
+    if (retryBtn) retryBtn.onclick=()=>{ delete u.disabledReason; userFailureUntil.delete(u.id); saveState(); openUsersModal(); };
     card.querySelector(".delete-user").onclick = ()=>{ if(confirm("Delete "+u.name+"?")){ state.users=state.users.filter(x=>x.id!==u.id); state.chats.forEach(c=>c.userIds=(c.userIds||[]).filter(id=>id!==u.id)); saveState(); render(); openUsersModal(); } };
     root.appendChild(card);
   });
@@ -536,6 +546,18 @@ function setTyping(t="") {
   els.typingBar.classList.toggle("hidden",!t);
 }
 
+function isPaymentError(err) {
+  return /HTTP\s*402\b/i.test(String(err?.message||err||""));
+}
+
+function disableUserForProviderError(u,err) {
+  if (!isPaymentError(err)) return false;
+  u.disabledReason="HTTP 402 from Ollama cloud";
+  userFailureUntil.set(u.id,Number.MAX_SAFE_INTEGER);
+  saveState();
+  return true;
+}
+
 async function respondAll(extra="") {
   const c=activeChat();
   if (!c || busy) return;
@@ -544,6 +566,7 @@ async function respondAll(extra="") {
   busy=true; els.sendBtn.disabled=true;
   try {
     for (const u of users) {
+      if (u.disabledReason) continue;
       setTyping(u.name+" is thinking…");
       let liveMsg=null;
       try {
@@ -558,12 +581,16 @@ async function respondAll(extra="") {
         liveMsg.content=text;
         delete liveMsg.streaming;
       } catch(e) {
-        userFailureUntil.set(u.id,Date.now()+5*60*1000);
+        const payment=disableUserForProviderError(u,e);
+        if (!payment) userFailureUntil.set(u.id,Date.now()+5*60*1000);
+        const errorText=payment
+          ? "[Ollama cloud rejected this model with HTTP 402. This user is paused until you Retry or change its model.]"
+          : "[Ollama error: "+e.message+"]";
         if (liveMsg) {
-          liveMsg.content="[Ollama error: "+e.message+"]";
+          liveMsg.content=errorText;
           delete liveMsg.streaming;
         } else {
-          c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"[Ollama error: "+e.message+"]",createdAt:Date.now()});
+          c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:errorText,createdAt:Date.now()});
         }
       }
       c.updatedAt=Date.now(); saveState(); render();
@@ -583,7 +610,7 @@ function nextAutoUser(c) {
   for (let i=0;i<users.length;i++) {
     const user=users[c.autoCursor % users.length];
     c.autoCursor=(c.autoCursor+1)%users.length;
-    if ((userFailureUntil.get(user.id)||0) <= Date.now()) return user;
+    if (!user.disabledReason && (userFailureUntil.get(user.id)||0) <= Date.now()) return user;
   }
   return null;
 }
@@ -622,9 +649,12 @@ async function autoSpeakOnce(c) {
     liveMsg.content=text;
     delete liveMsg.streaming;
   } catch(e) {
+    const payment=disableUserForProviderError(u,e);
     const msg=String(e.message||"");
-    userFailureUntil.set(u.id,Date.now()+5*60*1000);
-    liveMsg.content="[Ollama error: "+msg+" — auto activity paused for this user for 5 minutes]";
+    if (!payment) userFailureUntil.set(u.id,Date.now()+5*60*1000);
+    liveMsg.content=payment
+      ? "[Ollama cloud rejected this model with HTTP 402. Auto activity disabled until Retry/model change.]"
+      : "[Ollama error: "+msg+" — auto activity paused for this user for 5 minutes]";
     delete liveMsg.streaming;
   }
 
@@ -654,7 +684,7 @@ async function runChatActivity(chatId,{durationMs=10000,maxTurns=2}={}) {
       turns++;
 
       if (turns<maxTurns && Date.now()<deadline) {
-        await new Promise(resolve=>setTimeout(resolve,3000));
+        await new Promise(resolve=>setTimeout(resolve,8000));
       }
     }
 
@@ -673,23 +703,30 @@ function startUserActivity(chatId) {
   const c=getChat(chatId);
   if (!c) return;
 
-  // User-triggered activity is intentionally longer and chattier.
   (async()=>{
     if (chatActivityRunning.has(chatId)) return;
     chatActivityRunning.add(chatId);
     const deadline=Date.now()+USER_ACTIVITY;
     let turns=0;
     try {
-      while (Date.now()<deadline && turns<5 && state.activeChatId===chatId) {
+      // The normal user message already caused immediate replies.
+      // Wait before any extra autonomous continuation.
+      await new Promise(resolve=>setTimeout(resolve,15000));
+
+      while (Date.now()<deadline && turns<3 && state.activeChatId===chatId) {
         const current=getChat(chatId);
         if (!current) break;
         const spoke=await autoSpeakOnce(current);
         if (!spoke) break;
         turns++;
-        if (turns<5 && Date.now()<deadline) {
-          await new Promise(resolve=>setTimeout(resolve,8000));
+
+        if (turns<3 && Date.now()+20000<deadline) {
+          await new Promise(resolve=>setTimeout(resolve,20000));
+        } else {
+          break;
         }
       }
+
       const current=getChat(chatId);
       if (current) {
         const users=(current.userIds||[]).map(getUser).filter(Boolean);
