@@ -502,6 +502,34 @@ function searchAllChats(query, limit=24) {
     .map(o=>o.x);
 }
 
+function cleanContextMessages(c) {
+  return (c.messages||[]).filter(m=>!m.systemError && !m.legacyErrorLike && String(m.content||"").trim());
+}
+
+function currentTopicText(c) {
+  const recent=cleanContextMessages(c).slice(-6);
+  if (!recent.length) return "(No recent topic yet.)";
+  return recent.map(m=>speakerForMessage(m)+": "+splitGcThink(m.content||"").visible).join("\n");
+}
+
+function normalizedText(s="") {
+  return String(s).toLowerCase().replace(/[^a-z0-9\s]/g," ").replace(/\s+/g," ").trim();
+}
+
+function isTooSimilarToRecent(text,c) {
+  const n=normalizedText(text);
+  if (!n) return false;
+  const recent=cleanContextMessages(c).slice(-8);
+  return recent.some(m=>{
+    const r=normalizedText(m.content||"");
+    if (!r) return false;
+    if (n===r) return true;
+    if (n.length>30 && r.includes(n)) return true;
+    if (r.length>30 && n.includes(r)) return true;
+    return false;
+  });
+}
+
 function buildSystem(u,c) {
   const participants=(c.userIds||[]).map(getUser).filter(Boolean).map(x=>x.id===u.id?x.name+" (you)":x.name).join(", ");
   return [
@@ -509,17 +537,24 @@ function buildSystem(u,c) {
     u.personality ? "Your personality:\n"+u.personality : "",
     "Participants: "+participants+".",
     "Reply only as "+u.name+". Do not write dialogue for anyone else and do not prefix replies with your name.",
-    "CONTEXT LAYERS:",
-    "PREVIOUS CHAT MESSAGES (summary of older messages from this exact chat):\n"+(c.summary||"(none yet)"),
-    "EVERYTHING ELSE (big cross-chat summary):\n"+(u.overview||"(No cross-chat overview yet.)"),
-    "The exact recent messages will be supplied separately after this system prompt.",
+    "RELEVANCE RULES:",
+    "- The CURRENT TOPIC and exact recent messages matter most.",
+    "- Reply to what was said most recently unless someone directly asked about an older topic.",
+    "- Older summaries are background memory only. Do NOT revive old jokes, errors, or topics just because they appear there.",
+    "- Avoid repeating a joke, observation, or point that was already made recently.",
+    "- If the conversation changed topics, follow the new topic immediately.",
+    "- If you genuinely have nothing relevant to add during autonomous chat, output exactly [[PASS]] and nothing else.",
+    "CURRENT TOPIC (highest priority):\n"+currentTopicText(c),
+    "PREVIOUS CHAT MESSAGES (older summary; background only):\n"+(c.summary||"(none yet)"),
+    "EVERYTHING ELSE (cross-chat background; use only when relevant):\n"+(u.overview||"(No cross-chat overview yet.)"),
+    "The exact recent messages are supplied separately after this system prompt.",
     "If you want to show a brief user-visible thought summary, put it in <gcthink>...</gcthink>. Keep it concise and high-level. Never use ordinary <think> tags.",
-    "You have a Remember tool. If you need a specific detail from any earlier chat that is not clear in the summaries, output exactly [[REMEMBER: search words]] and nothing else. The app will search all chats and give you matching history, then you can answer normally."
+    "You have a Remember tool. If you need a specific detail from earlier chats that is not clear in context, output exactly [[REMEMBER: search words]] and nothing else."
   ].filter(Boolean).join("\n\n");
 }
 
 function recentMessages(u,c) {
-  const exact=(c.messages||[]).filter(m=>!m.systemError && !m.legacyErrorLike).slice(-18);
+  const exact=cleanContextMessages(c).slice(-12);
   return exact.map(m => {
     const replied=getMessage(c,m.replyTo);
     const replyContext=replied ? " [replying to "+speakerForMessage(replied)+": "+splitGcThink(replied.content||"").visible.slice(0,220)+"]" : "";
@@ -619,8 +654,8 @@ async function updateChatSummary(c) {
   if (!summarizer) return;
 
   const prompt=
-    "Update the running summary for this group chat. Preserve important ongoing topics, decisions, jokes, relationships, unresolved questions, and useful context. " +
-    "Compress aggressively, do not quote everything, and do not invent anything. Return one concise paragraph or a few compact paragraphs.\n\n" +
+    "Update the running summary for this group chat. Preserve durable facts, ongoing projects, relationships, unresolved questions, and only jokes/topics that are still clearly recurring. " +
+    "Drop stale one-off jokes, temporary errors, repeated filler, and superseded topics. Compress aggressively, do not quote everything, and do not invent anything. Return one concise paragraph or a few compact paragraphs.\n\n" +
     "Existing summary:\n"+(c.summary||"(none)")+"\n\nMessages to fold into the summary:\n"+transcript;
 
   try {
@@ -639,8 +674,8 @@ async function updateOverview(u) {
   const transcript=history.map(x=>"["+x.chat+"] "+x.speaker+": "+x.text).join("\n");
   const prompt =
     "Rewrite "+u.name+"'s remembrance as ONE concise overview of their conversations so far. " +
-    "It should summarize important people, ongoing topics/projects, relationships, preferences, recurring jokes, and notable events. " +
-    "Do not make a bullet list of atomic facts. Keep useful context, drop trivial details, and do not invent anything.\n\n" +
+    "It should summarize important people, ongoing projects, relationships, preferences, and only genuinely recurring jokes or notable events. " +
+    "Do not preserve temporary errors, one-off jokes, repetitive filler, or stale topics just because they appeared many times. Do not make a bullet list of atomic facts. Keep useful context, drop trivial details, and do not invent anything.\n\n" +
     "Previous overview:\n"+(u.overview||"(none)")+"\n\nRecent conversation history:\n"+transcript;
   try {
     u.overview=await rawChat(u.model,[{role:"user",content:prompt}],{temperature:0.2,stream:false,timeoutMs:15000});
@@ -696,8 +731,13 @@ async function respondAll(extra="",targetUserIds=null) {
           saveState();
           if (state.activeChatId===c.id) renderActiveChat();
         });
-        liveMsg.content=text;
-        delete liveMsg.streaming;
+        if (/^\s*\[\[PASS\]\]\s*$/i.test(text)) {
+          c.messages=c.messages.filter(m=>m.id!==liveMsg.id);
+          liveMsg=null;
+        } else {
+          liveMsg.content=text;
+          delete liveMsg.streaming;
+        }
       } catch(e) {
         userFailureUntil.set(u.id,Date.now()+5*60*1000);
         const errorText="[Ollama error: "+e.message+"]";
@@ -754,13 +794,19 @@ async function autoSpeakOnce(c) {
     const text=await callUser(
       u,
       c,
-      "Continue the group chat naturally on your own. React to the recent conversation or another participant. Do not mention that this is automatic/background activity.",
+      "Continue the CURRENT conversation naturally. Focus on the most recent 1-3 messages. Do not revive an older topic or running joke unless the latest messages clearly connect to it. If you have nothing genuinely relevant to add, output exactly [[PASS]]. Do not mention that this is automatic/background activity.",
       (full)=>{
         liveMsg.content=full;
         saveState();
         if (state.activeChatId===c.id) renderActiveChat();
       }
     );
+    if (/^\s*\[\[PASS\]\]\s*$/i.test(text) || isTooSimilarToRecent(text,c)) {
+      c.messages=c.messages.filter(m=>m.id!==liveMsg.id);
+      saveState();
+      if (state.activeChatId===c.id) renderActiveChat();
+      return false;
+    }
     liveMsg.content=text;
     delete liveMsg.streaming;
   } catch(e) {
