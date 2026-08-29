@@ -813,35 +813,31 @@ async function runChatActivity(chatId,{durationMs=10000,maxTurns=2}={}) {
 
 function startUserActivity(chatId) {
   if (state.activeChatId!==chatId) return;
+
   const generation=(activeActivityGeneration.get(chatId)||0)+1;
   activeActivityGeneration.set(chatId,generation);
 
   (async()=>{
-    // Wait for actual silence. Any new human message increments the generation
-    // and cancels this pending continuation.
-    await new Promise(resolve=>setTimeout(resolve,30000));
-    if (activeActivityGeneration.get(chatId)!==generation) return;
-    if (state.activeChatId!==chatId) return;
+    // Give the human a chance to continue first.
+    await new Promise(resolve=>setTimeout(resolve,25000));
+
+    while (activeActivityGeneration.get(chatId)===generation && state.activeChatId===chatId) {
+      const c=getChat(chatId);
+      if (!c) break;
+
+      const spoke=await autoSpeakOnce(c);
+      if (!spoke) break;
+
+      // Keep the GC alive, but at a human-ish pace instead of machine-gunning.
+      const pause=18000+Math.floor(Math.random()*17000);
+      await new Promise(resolve=>setTimeout(resolve,pause));
+    }
 
     const c=getChat(chatId);
-    if (!c) return;
-
-    // One natural continuation after 30 seconds of silence.
-    await autoSpeakOnce(c);
-
-    // A second continuation can happen around the one-minute mark,
-    // but only if the human still hasn't said anything.
-    await new Promise(resolve=>setTimeout(resolve,30000));
-    if (activeActivityGeneration.get(chatId)!==generation) return;
-    if (state.activeChatId!==chatId) return;
-
-    const current=getChat(chatId);
-    if (!current) return;
-    await autoSpeakOnce(current);
-
-    await updateChatSummary(current);
-    const users=(current.userIds||[]).map(getUser).filter(Boolean);
-    await Promise.all(users.map(updateOverview));
+    if (c) {
+      const users=(c.userIds||[]).map(getUser).filter(Boolean);
+      updateContextInBackground(c,users);
+    }
   })();
 }
 
