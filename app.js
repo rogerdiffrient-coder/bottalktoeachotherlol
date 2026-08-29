@@ -11,6 +11,11 @@ let state = loadState();
 let installedModels = [];
 let cloudModels = [];
 let busy = false;
+const chatActivityUntil = new Map();
+const chatActivityRunning = new Set();
+const FIVE_MINUTES = 5 * 60 * 1000;
+const SHORT_ACTIVITY = 10 * 1000;
+const USER_ACTIVITY = 60 * 1000;
 
 const FALLBACK_CLOUD_MODELS = [
   "nemotron-3-super:cloud",
@@ -516,15 +521,25 @@ async function respondAll(extra="") {
   try {
     for (const u of users) {
       setTyping(u.name+" is thinking…");
+      let liveMsg=null;
       try {
-        const liveMsg={id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"",createdAt:Date.now(),streaming:true};
+        liveMsg={id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"",createdAt:Date.now(),streaming:true};
         c.messages.push(liveMsg);
         saveState(); render();
-        const text=await callUser(u,c,extra,(full)=>{ liveMsg.content=full; saveState(); renderActiveChat(); });
+        const text=await callUser(u,c,extra,(full)=>{
+          liveMsg.content=full;
+          saveState();
+          if (state.activeChatId===c.id) renderActiveChat();
+        });
         liveMsg.content=text;
         delete liveMsg.streaming;
       } catch(e) {
-        c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"[Ollama error: "+e.message+"]",createdAt:Date.now()});
+        if (liveMsg) {
+          liveMsg.content="[Ollama error: "+e.message+"]";
+          delete liveMsg.streaming;
+        } else {
+          c.messages.push({id:uid("msg"),role:"assistant",userId:u.id,name:u.name,content:"[Ollama error: "+e.message+"]",createdAt:Date.now()});
+        }
       }
       c.updatedAt=Date.now(); saveState(); render();
     }
@@ -534,6 +549,99 @@ async function respondAll(extra="") {
     busy=false; els.sendBtn.disabled=false; setTyping("");
   }
 }
+
+function nextAutoUser(c) {
+  const users=(c.userIds||[]).map(getUser).filter(Boolean);
+  if (!users.length) return null;
+  c.autoCursor = Number.isInteger(c.autoCursor) ? c.autoCursor : 0;
+  const user=users[c.autoCursor % users.length];
+  c.autoCursor=(c.autoCursor+1)%users.length;
+  return user;
+}
+
+async function autoSpeakOnce(c) {
+  const u=nextAutoUser(c);
+  if (!u) return false;
+
+  const liveMsg={
+    id:uid("msg"),
+    role:"assistant",
+    userId:u.id,
+    name:u.name,
+    content:"",
+    createdAt:Date.now(),
+    streaming:true,
+    autonomous:true
+  };
+  c.messages.push(liveMsg);
+  c.updatedAt=Date.now();
+  saveState();
+  renderChatList();
+  if (state.activeChatId===c.id) renderActiveChat();
+
+  try {
+    const text=await callUser(
+      u,
+      c,
+      "Continue the group chat naturally on your own. React to the recent conversation or another participant. Do not mention that this is automatic/background activity.",
+      (full)=>{
+        liveMsg.content=full;
+        saveState();
+        if (state.activeChatId===c.id) renderActiveChat();
+      }
+    );
+    liveMsg.content=text;
+    delete liveMsg.streaming;
+  } catch(e) {
+    liveMsg.content="[Ollama error: "+e.message+"]";
+    delete liveMsg.streaming;
+  }
+
+  c.updatedAt=Date.now();
+  saveState();
+  renderChatList();
+  if (state.activeChatId===c.id) renderActiveChat();
+  return true;
+}
+
+async function runChatActivity(chatId) {
+  if (chatActivityRunning.has(chatId)) return;
+  chatActivityRunning.add(chatId);
+  try {
+    while (Date.now() < (chatActivityUntil.get(chatId)||0)) {
+      const c=getChat(chatId);
+      if (!c) break;
+      const hasUsers=(c.userIds||[]).some(id=>getUser(id));
+      if (!hasUsers) break;
+
+      await autoSpeakOnce(c);
+
+      // Tiny pause so one fast local model cannot flood a chat instantly.
+      await new Promise(resolve=>setTimeout(resolve,700));
+    }
+
+    const c=getChat(chatId);
+    if (c) {
+      const users=(c.userIds||[]).map(getUser).filter(Boolean);
+      await Promise.all(users.map(updateOverview));
+    }
+  } finally {
+    chatActivityRunning.delete(chatId);
+    if (Date.now() < (chatActivityUntil.get(chatId)||0)) runChatActivity(chatId);
+  }
+}
+
+function startChatActivity(chatId,durationMs) {
+  const until=Date.now()+durationMs;
+  chatActivityUntil.set(chatId,Math.max(chatActivityUntil.get(chatId)||0,until));
+  runChatActivity(chatId);
+}
+
+function pulseAllChats() {
+  state.chats.forEach(c=>startChatActivity(c.id,SHORT_ACTIVITY));
+}
+
+setInterval(pulseAllChats,FIVE_MINUTES);
 
 async function sendMessage() {
   const c=activeChat();
@@ -546,6 +654,7 @@ async function sendMessage() {
   autoResize();
   saveState(); render();
   await respondAll();
+  startChatActivity(c.id,USER_ACTIVITY);
 }
 
 async function rememberNow() {
